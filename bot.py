@@ -1,8 +1,12 @@
 """EURUSD 5m bearish market structure shift alert -> Telegram.
 
 Alert only. It never places trades.
-Rule (v1): in an uptrend (higher highs + higher lows), alert when a 5m candle
-CLOSES below the most recent swing low (the last higher low).
+
+Rule (v2, built from the trader's screenshots):
+1. A recent swing high (H) exists.
+2. Price later SWEEPS H: a candle trades above it (liquidity taken).
+3. L = the lowest low between H and the sweeping candle (base of the sweep leg).
+4. Alert when a 5m candle trades below L for the first time (a wick is enough).
 """
 import json
 import os
@@ -10,13 +14,19 @@ import sys
 
 import pandas as pd
 import requests
-import yfinance as yf
 
 SYMBOL = "EURUSD=X"
 NAME = "EURUSD"
-LOOKBACK = 3        # candles each side to confirm a swing high/low
-CHECK_LAST = 4      # look back this many closed candles (covers late runs)
+LOOKBACK = 3          # candles each side to confirm a swing high
+MAX_SWING_AGE = 72    # a swing high stays "recent" for this many 5m bars (6h)
+MAX_SWEEP_AGE = 48    # max bars from the sweep to the break (4h)
+CHECK_LAST = 4        # re-check this many latest closed candles (covers late runs)
+HISTORY = 300         # bars used for the calculation
 STATE_FILE = "state.json"
+
+# Session filter in UTC hours, e.g. [(7, 11), (13, 17)] for London + New York.
+# None = alert at any time. We will set this once your chart time zone is known.
+SESSIONS_UTC = None
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -42,42 +52,55 @@ def save_state(state):
 
 
 def get_candles():
+    import yfinance as yf
+
     df = yf.Ticker(SYMBOL).history(period="2d", interval="5m")
     if df is None or df.empty:
         return None
     df.index = pd.to_datetime(df.index).tz_convert("UTC")
-    # Drop the candle that is still forming
     now = pd.Timestamp.now(tz="UTC")
     if df.index[-1] + pd.Timedelta(minutes=5) > now:
-        df = df.iloc[:-1]
+        df = df.iloc[:-1]  # drop the candle still forming
     return df
 
 
-def pivots(d):
-    highs, lows = [], []
-    h, l = d["High"].values, d["Low"].values
-    for i in range(LOOKBACK, len(d) - LOOKBACK):
-        if h[i] == h[i - LOOKBACK:i + LOOKBACK + 1].max():
-            highs.append((i, float(h[i])))
-        if l[i] == l[i - LOOKBACK:i + LOOKBACK + 1].min():
-            lows.append((i, float(l[i])))
-    return highs, lows
+def swing_highs(d):
+    h = d["High"].values
+    return [
+        i
+        for i in range(LOOKBACK, len(d) - LOOKBACK)
+        if h[i] == h[i - LOOKBACK:i + LOOKBACK + 1].max()
+    ]
 
 
 def shift_at(df, b):
-    """Return the broken swing-low level if candle b caused a bearish shift."""
-    d = df.iloc[:b + 1]
-    highs, lows = pivots(d)
-    if len(highs) < 2 or len(lows) < 2:
-        return None
-    uptrend = highs[-1][1] > highs[-2][1] and lows[-1][1] > lows[-2][1]
-    if not uptrend:
-        return None
-    level = lows[-1][1]
-    c = d["Close"].values
-    if len(c) >= 2 and c[-1] < level <= c[-2]:
-        return level
+    """If candle b is the first to trade below the base of a swept high, return
+    (swept_high, broken_low). Otherwise None."""
+    d = df.iloc[max(0, b + 1 - HISTORY):b + 1].reset_index(drop=True)
+    n = len(d)
+    last = n - 1
+    h, l, c = d["High"].values, d["Low"].values, d["Close"].values
+
+    for i in reversed(swing_highs(d)):
+        if last - i > MAX_SWING_AGE:
+            break
+        peak = h[i]
+        # first candle after the swing high that trades above it = the sweep
+        s = next((k for k in range(i + 1, n) if h[k] > peak), None)
+        if s is None or s >= last or last - s > MAX_SWEEP_AGE:
+            continue
+        level = l[i:s + 1].min()
+        if (l[s + 1:last] < level).any():
+            continue  # already broken earlier, not a fresh shift
+        if l[last] < level:
+            return float(peak), float(level)
     return None
+
+
+def in_session(ts):
+    if not SESSIONS_UTC:
+        return True
+    return any(a <= ts.hour < z for a, z in SESSIONS_UTC)
 
 
 def main():
@@ -92,7 +115,7 @@ def main():
     save_state(state)  # make sure the file exists
 
     df = get_candles()
-    if df is None or len(df) < 20:
+    if df is None or len(df) < 30:
         print("No data (market closed or data gap).")
         return
 
@@ -100,20 +123,22 @@ def main():
     newest = None
     n = len(df)
     for b in range(max(n - CHECK_LAST, 0), n):
-        level = shift_at(df, b)
-        if level is None:
-            continue
         t = df.index[b]
         if last_alert is not None and t <= last_alert:
             continue
-        newest = (t, float(df["Close"].iloc[b]), level)
+        if not in_session(t):
+            continue
+        res = shift_at(df, b)
+        if res:
+            newest = (t, float(df["Close"].iloc[b]), res[0], res[1])
 
     if newest:
-        t, price, level = newest
+        t, price, peak, level = newest
         send(
             f"🔻 Bearish 5m MSS on {NAME} @ {price:.5f}\n"
-            f"Broke swing low {level:.5f}\n"
-            f"Candle close: {t.strftime('%Y-%m-%d %H:%M')} UTC"
+            f"Swept high: {peak:.5f}\n"
+            f"Broke low: {level:.5f}\n"
+            f"Candle: {t.strftime('%Y-%m-%d %H:%M')} UTC"
         )
         state["last_signal"] = t.isoformat()
         save_state(state)
