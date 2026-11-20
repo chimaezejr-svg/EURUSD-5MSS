@@ -5,7 +5,7 @@ Alert only. It never places trades.
 Rule (v2, built from the trader's screenshots):
 1. A recent swing high (H) exists.
 2. Price later SWEEPS H: a candle trades above it (liquidity taken).
-3. L = the lowest low between H and the sweeping candle (base of the sweep leg).
+3. L = the lowest low after H's candle, up to the sweeping candle (base of the sweep leg).
 4. Alert when a 5m candle trades below L for the first time (a wick is enough).
 """
 import json
@@ -17,9 +17,10 @@ import requests
 
 SYMBOL = "EURUSD=X"
 NAME = "EURUSD"
-LOOKBACK = 3          # candles each side to confirm a swing high
+LOOKBACK = 1          # candles each side to confirm a swing high (1 = local peak)
 MAX_SWING_AGE = 72    # a swing high stays "recent" for this many 5m bars (6h)
 MAX_SWEEP_AGE = 48    # max bars from the sweep to the break (4h)
+INCLUDE_FORMING = True  # True = alert the moment price wicks through, without waiting for the candle to close
 CHECK_LAST = 4        # re-check this many latest closed candles (covers late runs)
 HISTORY = 300         # bars used for the calculation
 STATE_FILE = "state.json"
@@ -59,7 +60,7 @@ def get_candles():
         return None
     df.index = pd.to_datetime(df.index).tz_convert("UTC")
     now = pd.Timestamp.now(tz="UTC")
-    if df.index[-1] + pd.Timedelta(minutes=5) > now:
+    if not INCLUDE_FORMING and df.index[-1] + pd.Timedelta(minutes=5) > now:
         df = df.iloc[:-1]  # drop the candle still forming
     return df
 
@@ -89,7 +90,7 @@ def shift_at(df, b):
         s = next((k for k in range(i + 1, n) if h[k] > peak), None)
         if s is None or s >= last or last - s > MAX_SWEEP_AGE:
             continue
-        level = l[i:s + 1].min()
+        level = l[i + 1:s + 1].min()  # lows AFTER the swing-high candle, up to the sweep
         if (l[s + 1:last] < level).any():
             continue  # already broken earlier, not a fresh shift
         if l[last] < level:
