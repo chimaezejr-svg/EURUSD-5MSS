@@ -1,12 +1,12 @@
-"""EURUSD 5m bearish market structure shift alert -> Telegram.
+"""ORYN 5m bearish market structure shift alerts -> Telegram.
 
 Alert only. It never places trades.
-
-Rule (v2, built from the trader's screenshots):
-1. A recent swing high (H) exists.
-2. Price later SWEEPS H: a candle trades above it (liquidity taken).
-3. L = the lowest low after H's candle, up to the sweeping candle (base of the sweep leg).
-4. Alert when a 5m candle trades below L for the first time (a wick is enough).
+Mirrors the engine in ORYN Indicator Pro1 candle by candle:
+- swing high  = candle whose high is >= the candle before it and the candle after it
+                (a neighbour may be higher by up to TOL: the equal-high tolerance)
+- sweep       = a later candle trades above that high (wick is enough)
+- base low    = lowest low after the swing-high candle, up to the sweep candle
+- shift       = first candle that trades below the base low (wick is enough)
 """
 import json
 import os
@@ -17,17 +17,14 @@ import requests
 
 SYMBOL = "EURUSD=X"
 NAME = "EURUSD"
-LOOKBACK = 1          # candles each side to confirm a swing high (1 = local peak)
-MAX_SWING_AGE = 72    # a swing high stays "recent" for this many 5m bars (6h)
-MAX_SWEEP_AGE = 48    # max bars from the sweep to the break (4h)
-INCLUDE_FORMING = True  # True = alert the moment price wicks through, without waiting for the candle to close
-CHECK_LAST = 4        # re-check this many latest closed candles (covers late runs)
-HISTORY = 300         # bars used for the calculation
+MAX_SWING_AGE = 72      # candles a swing high stays recent (same as indicator)
+MAX_SWEEP_AGE = 48      # max candles from sweep to break (same as indicator)
+TOL_PIPS = 0.3          # equal-high tolerance (same as indicator)
+TOL = TOL_PIPS * 0.0001
+HISTORY = "5d"          # warm-up so the engine has the same context as the chart
+MAX_AGE_MIN = 180       # still alert on shifts up to this old (covers late/skipped runs)
+INCLUDE_FORMING = True  # alert as soon as a wick breaks, without waiting for the close
 STATE_FILE = "state.json"
-
-# Session filter in UTC hours, e.g. [(7, 11), (13, 17)] for London + New York.
-# None = alert at any time. We will set this once your chart time zone is known.
-SESSIONS_UTC = None
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -55,53 +52,81 @@ def save_state(state):
 def get_candles():
     import yfinance as yf
 
-    df = yf.Ticker(SYMBOL).history(period="2d", interval="5m")
+    df = yf.Ticker(SYMBOL).history(period=HISTORY, interval="5m")
     if df is None or df.empty:
         return None
     df.index = pd.to_datetime(df.index).tz_convert("UTC")
-    now = pd.Timestamp.now(tz="UTC")
-    if not INCLUDE_FORMING and df.index[-1] + pd.Timedelta(minutes=5) > now:
-        df = df.iloc[:-1]  # drop the candle still forming
+    if not INCLUDE_FORMING:
+        now = pd.Timestamp.now(tz="UTC")
+        if df.index[-1] + pd.Timedelta(minutes=5) > now:
+            df = df.iloc[:-1]
     return df
 
 
-def swing_highs(d):
-    h = d["High"].values
-    return [
-        i
-        for i in range(LOOKBACK, len(d) - LOOKBACK)
-        if h[i] == h[i - LOOKBACK:i + LOOKBACK + 1].max()
-    ]
+class Engine:
+    """Python twin of the Pine engine (advance())."""
+
+    def __init__(self, tol, max_swing, max_sweep):
+        self.tol, self.max_swing, self.max_sweep = tol, max_swing, max_sweep
+        self.setups = []
+        self.n = 0
+        self.h1 = None
+        self.h2 = None
+
+    def advance(self, h, l, t):
+        hit = None
+        self.n += 1
+        cnt = self.n
+        for k in range(len(self.setups) - 1, -1, -1):
+            s = self.setups[k]
+            drop = False
+            hm_old = s["hm"]
+            if cnt - s["pn"] > self.max_swing:
+                drop = True
+            elif s["sn"] == -1:
+                if l < s["mn"]:
+                    s["mn"] = l
+                if h > s["pk"]:
+                    s["sn"] = cnt
+            elif cnt - s["sn"] > self.max_sweep:
+                drop = True
+            elif l < s["mn"]:
+                drop = True
+                if hit is None:
+                    hit = {"t": t, "swept": s["pk"], "low": s["mn"], "top": hm_old}
+            if drop:
+                self.setups.pop(k)
+            elif h > hm_old:
+                s["hm"] = h
+        if (
+            cnt >= 3
+            and self.h1 is not None
+            and self.h2 is not None
+            and self.h1 + self.tol >= self.h2
+            and self.h1 + self.tol >= h
+        ):
+            self.setups.append(
+                {
+                    "pk": self.h1,
+                    "mn": l,
+                    "pn": cnt - 1,
+                    "sn": cnt if h > self.h1 else -1,
+                    "hm": h if h > self.h1 else self.h1,
+                }
+            )
+        self.h2 = self.h1
+        self.h1 = h
+        return hit
 
 
-def shift_at(df, b):
-    """If candle b is the first to trade below the base of a swept high, return
-    (swept_high, broken_low). Otherwise None."""
-    d = df.iloc[max(0, b + 1 - HISTORY):b + 1].reset_index(drop=True)
-    n = len(d)
-    last = n - 1
-    h, l, c = d["High"].values, d["Low"].values, d["Close"].values
-
-    for i in reversed(swing_highs(d)):
-        if last - i > MAX_SWING_AGE:
-            break
-        peak = h[i]
-        # first candle after the swing high that trades above it = the sweep
-        s = next((k for k in range(i + 1, n) if h[k] > peak), None)
-        if s is None or s >= last or last - s > MAX_SWEEP_AGE:
-            continue
-        level = l[i + 1:s + 1].min()  # lows AFTER the swing-high candle, up to the sweep
-        if (l[s + 1:last] < level).any():
-            continue  # already broken earlier, not a fresh shift
-        if l[last] < level:
-            return float(peak), float(level)
-    return None
-
-
-def in_session(ts):
-    if not SESSIONS_UTC:
-        return True
-    return any(a <= ts.hour < z for a, z in SESSIONS_UTC)
+def find_shifts(df):
+    eng = Engine(TOL, MAX_SWING_AGE, MAX_SWEEP_AGE)
+    hits = []
+    for t, row in df.iterrows():
+        r = eng.advance(float(row["High"]), float(row["Low"]), t)
+        if r:
+            hits.append(r)
+    return hits
 
 
 def main():
@@ -113,39 +138,43 @@ def main():
         return
 
     state = load_state()
-    save_state(state)  # make sure the file exists
+    first_run = "sent" not in state
+    sent = set(state.get("sent", []))
+    if "last_signal" in state:
+        sent.add(pd.Timestamp(state["last_signal"]).isoformat())
 
     df = get_candles()
     if df is None or len(df) < 30:
         print("No data (market closed or data gap).")
+        save_state({"sent": sorted(sent)[-100:]})
         return
 
-    last_alert = pd.Timestamp(state["last_signal"]) if "last_signal" in state else None
-    newest = None
-    n = len(df)
-    for b in range(max(n - CHECK_LAST, 0), n):
-        t = df.index[b]
-        if last_alert is not None and t <= last_alert:
-            continue
-        if not in_session(t):
-            continue
-        res = shift_at(df, b)
-        if res:
-            newest = (t, float(df["Close"].iloc[b]), res[0], res[1])
+    now = pd.Timestamp.now(tz="UTC")
+    recent = [
+        h for h in find_shifts(df)
+        if now - h["t"] <= pd.Timedelta(minutes=MAX_AGE_MIN)
+    ]
 
-    if newest:
-        t, price, peak, level = newest
-        send(
-            f"🔻 Bearish 5m MSS on {NAME} @ {price:.5f}\n"
-            f"Swept high: {peak:.5f}\n"
-            f"Broke low: {level:.5f}\n"
-            f"Candle: {t.strftime('%Y-%m-%d %H:%M')} UTC"
-        )
-        state["last_signal"] = t.isoformat()
-        save_state(state)
-        print("Alert sent for", t)
+    if first_run:
+        for h in recent:  # first run: do not spam old shifts
+            sent.add(h["t"].isoformat())
+        print(f"First run: marked {len(recent)} recent shifts as already seen.")
     else:
-        print("No new signal.")
+        for h in sorted(recent, key=lambda x: x["t"]):
+            key = h["t"].isoformat()
+            if key in sent:
+                continue
+            send(
+                f"🔻 Bearish 5m MSS on {NAME}\n"
+                f"Swept high: {h['swept']:.5f}\n"
+                f"Broke low: {h['low']:.5f}\n"
+                f"Top of the move: {h['top']:.5f}\n"
+                f"Candle: {h['t'].strftime('%Y-%m-%d %H:%M')} UTC"
+            )
+            sent.add(key)
+            print("Alert sent for", key)
+
+    save_state({"sent": sorted(sent)[-100:]})
 
 
 if __name__ == "__main__":
